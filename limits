@@ -7,7 +7,7 @@ Claude: one profile per ~/.claude and ~/.claude-*; the token comes from the same
         item the CLI uses, and the CLI's own cached usage is shown when the token is expired.
 Codex:  one profile per ~/.codex and ~/.codex-*; the token comes from auth.json.
 """
-import base64, glob, hashlib, json, os, subprocess, sys, time, urllib.request
+import base64, glob, hashlib, json, os, subprocess, sys, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -15,9 +15,44 @@ HOME = os.path.expanduser("~")
 USER = os.environ.get("USER", "")
 
 
+CACHE = os.path.join(HOME, ".cache", "limits")
+
+
 def get(url, headers):
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=10) as r:
         return json.load(r)
+
+
+def hhmm(epoch):
+    return datetime.fromtimestamp(epoch).strftime("%H:%M")
+
+
+def fetch_cached(key, fn, backoff=600):
+    """Run fn(); keep the last good result on disk and serve it when a call fails.
+    After a 429 the network is left alone for `backoff` seconds (the usage endpoints are rate-limited
+    and several CLI sessions poll them too). Returns (data or None, note)."""
+    path = os.path.join(CACHE, key.replace("/", "_") + ".json")
+    try:
+        c = json.load(open(path))
+    except Exception:
+        c = {}
+    stale = f"cached {hhmm(c['at'])}" if c.get("u") else "no cached data yet"
+    if c.get("fail_code") == 429 and time.time() - c.get("fail_at", 0) < backoff:
+        return c.get("u"), f"rate limited · {stale}"
+    try:
+        u = fn()
+        c = {"at": time.time(), "u": u}
+    except urllib.error.HTTPError as e:
+        c.update(fail_at=time.time(), fail_code=e.code)
+        msg = "rate limited" if e.code == 429 else f"HTTP {e.code}"
+    except Exception as e:
+        c.update(fail_at=time.time(), fail_code=None)
+        msg = str(e)[:40]
+    else:
+        msg = None
+    os.makedirs(CACHE, exist_ok=True)
+    json.dump(c, open(path, "w"))
+    return c.get("u"), "" if msg is None else f"{msg} · {stale}"
 
 
 def jwt(tok):
@@ -71,17 +106,18 @@ def claude_token(svc):
 def claude_usage(d, acct, svc, cache):
     row = {"provider": "claude", "name": acct["emailAddress"], "plan": (acct.get("organizationType") or "").replace("claude_", ""), "note": "",
            "dir": d, "primary": primary_dir(f"{HOME}/.claude") == d}
-    tok, u = claude_token(svc), None
-    if tok:
-        try:
-            u = get("https://api.anthropic.com/api/oauth/usage", {"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
-        except Exception as e:
-            row["note"] = f"fetch failed: {str(e)[:40]}"
-    if u is None and cache and cache.get("accountUuid") == acct.get("accountUuid"):
+    tok = claude_token(svc)
+
+    def fn():
+        if not tok:
+            raise RuntimeError("token expired; open a session")
+        return get("https://api.anthropic.com/api/oauth/usage", {"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
+
+    u, row["note"] = fetch_cached(f"claude-{row['name']}", fn)
+    if u is None and cache and cache.get("accountUuid") == acct.get("accountUuid"):   # the CLI's own cache as a last resort
         u = cache.get("utilization")
-        row["note"] = row["note"] or "cached " + datetime.fromtimestamp(cache["fetchedAtMs"] / 1000).strftime("%H:%M") + ("" if tok else ", token expired")
+        row["note"] += f" · CLI cache {hhmm(cache['fetchedAtMs'] / 1000)}"
     if u is None:
-        row["note"] = row["note"] or "no live token; open a session once"
         return row
     fh, sd = u.get("five_hour") or {}, u.get("seven_day") or {}
     row["5h"] = window(fh.get("utilization"), fh.get("resets_at"), 5 * 3600)
@@ -109,14 +145,16 @@ def codex_usage(d, t):
     auth = claims.get("https://api.openai.com/auth") or {}
     row = {"provider": "codex", "name": claims.get("email") or "?", "plan": auth.get("chatgpt_plan_type") or "", "note": "",
            "dir": d, "primary": primary_dir(f"{HOME}/.codex") == d}
-    if jwt(t["access_token"]).get("exp", 0) < time.time():
-        row["note"] = "token expired; open a codex session once"
-        return row
     hdr = {"Authorization": f"Bearer {t['access_token']}", "ChatGPT-Account-Id": t.get("account_id") or auth.get("chatgpt_account_id", ""), "User-Agent": "limits/1"}
-    try:
-        u = get("https://chatgpt.com/backend-api/wham/usage", hdr)
-    except Exception as e:
-        row["note"] = f"fetch failed: {str(e)[:40]}"
+    expired = jwt(t["access_token"]).get("exp", 0) < time.time()
+
+    def fn():
+        if expired:
+            raise RuntimeError("token expired; open a codex session")
+        return get("https://chatgpt.com/backend-api/wham/usage", hdr)
+
+    u, row["note"] = fetch_cached(f"codex-{row['name']}", fn)
+    if u is None:
         return row
 
     def win(w):
@@ -140,15 +178,14 @@ def codex_usage(d, t):
     row["plan"] = u.get("plan_type") or row["plan"]
     cr = u.get("credits") or {}
     if cr:
-        row["note"] = "credits: " + ("unlimited" if cr.get("unlimited") else f"{cr.get('balance') or 0}" + ("" if cr.get("has_credits") else " (out)"))
+        credits = "credits: " + ("unlimited" if cr.get("unlimited") else f"{cr.get('balance') or 0}" + ("" if cr.get("has_credits") else " (out)"))
+        row["note"] = " · ".join(x for x in (credits, row["note"]) if x)
     rc = u.get("rate_limit_reset_credits") or {}
     if rc.get("available_count") is not None:   # Codex perk: reset a hit limit early
         lr = {"available": rc.get("available_count"), "usable_now": rc.get("applicable_available_count")}
-        try:   # each credit expires on its own date
-            cs = get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", hdr).get("credits") or []
-            lr["expires"] = sorted(e for e in (window(None, c.get("expires_at"), None)["resets_epoch"] for c in cs if c.get("status") == "available") if e)
-        except Exception:
-            pass
+        cs, _ = fetch_cached(f"codex-resets-{row['name']}", lambda: get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", hdr))
+        if cs:   # each credit expires on its own date
+            lr["expires"] = sorted(e for e in (window(None, c.get("expires_at"), None)["resets_epoch"] for c in cs.get("credits") or [] if c.get("status") == "available") if e)
         row["limit_resets"] = lr
     return row
 

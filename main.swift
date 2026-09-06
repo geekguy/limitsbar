@@ -196,10 +196,12 @@ struct RowView: View {
             if let ex = row.limitResets?.expires, !ex.isEmpty {
                 Text("limit resets expire " + expiryList(ex, now: now)).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
+            // a row with no windows at all is a failed fetch, not a plan without limits
+            let missing = (row.fiveH == nil && row.week == nil) ? "no data" : "not tracked on this plan"
             HStack(alignment: .top, spacing: 14) {
-                Bar(label: "5 hour", win: row.fiveH, now: now)
-                Bar(label: "Weekly", win: row.week, now: now)
-                if row.fable != nil { Bar(label: "Fable weekly", win: row.fable, now: now) }   // Max plans only
+                Bar(label: "5 hour", win: row.fiveH, now: now, missing: missing)
+                Bar(label: "Weekly", win: row.week, now: now, missing: missing)
+                if row.fable != nil { Bar(label: "Fable weekly", win: row.fable, now: now, missing: missing) }   // Max plans only
             }
         }
         .padding(10)
@@ -217,7 +219,7 @@ struct Tag: View {
 }
 
 struct Bar: View {
-    let label: String; let win: Win?; let now: Date
+    let label: String; let win: Win?; let now: Date; var missing = "not tracked on this plan"
     var body: some View {
         let pct = win?.pct
         VStack(alignment: .leading, spacing: 3) {
@@ -247,7 +249,7 @@ struct Bar: View {
     }
 
     var resetText: String {
-        guard win?.pct != nil else { return "not tracked on this plan" }
+        guard win?.pct != nil else { return missing }
         guard let r = win?.resetsEpoch else { return "no reset time reported" }
         let date = Date(timeIntervalSince1970: r), rem = date.timeIntervalSince(now)
         if rem <= 0 { return "resets now" }
