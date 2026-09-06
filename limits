@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""limits — 5h / weekly / Fable usage across every Claude Code and Codex account.
+
+usage: limits [--watch [SECONDS]] [--json]
+
+Claude: one profile per ~/.claude and ~/.claude-*; the token comes from the same Keychain
+        item the CLI uses, and the CLI's own cached usage is shown when the token is expired.
+Codex:  one profile per ~/.codex and ~/.codex-*; the token comes from auth.json.
+"""
+import base64, glob, hashlib, json, os, subprocess, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+USER = os.environ.get("USER", "")
+
+
+def get(url, headers):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=10) as r:
+        return json.load(r)
+
+
+def jwt(tok):
+    p = tok.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+
+
+def window(pct, resets_iso, seconds):
+    """One rate-limit window; epoch + window length let the UI draw a reset countdown/timeline."""
+    try:
+        epoch = datetime.fromisoformat(str(resets_iso).replace("Z", "+00:00")).timestamp() if resets_iso else None
+    except Exception:
+        epoch = None
+    return {"pct": pct, "resets": resets_iso, "resets_epoch": epoch, "window_seconds": seconds}
+
+
+# ---------- Claude ----------
+def claude_profiles():
+    for d in [f"{HOME}/.claude"] + sorted(glob.glob(f"{HOME}/.claude-*/")):
+        d = d.rstrip("/")
+        cfg = f"{HOME}/.claude.json" if d == f"{HOME}/.claude" else f"{d}/.claude.json"
+        try:
+            c = json.load(open(cfg))
+        except Exception:
+            continue
+        acct = c.get("oauthAccount") or {}
+        if not acct.get("emailAddress"):
+            continue
+        # same service-name rule as the CLI: suffix = sha256(config dir)[:8] for non-default dirs
+        svc = "Claude Code-credentials" + ("" if d == f"{HOME}/.claude" else "-" + hashlib.sha256(d.encode()).hexdigest()[:8])
+        yield acct, svc, c.get("cachedUsageUtilization")
+
+
+def claude_token(svc):
+    out = subprocess.run(["security", "find-generic-password", "-a", USER, "-s", svc, "-w"], capture_output=True, text=True)
+    if out.returncode:
+        return None
+    t = json.loads(out.stdout).get("claudeAiOauth") or {}
+    return t.get("accessToken") if t.get("expiresAt", 0) / 1000 > time.time() else None
+
+
+def claude_usage(acct, svc, cache):
+    row = {"provider": "claude", "name": acct["emailAddress"], "plan": (acct.get("organizationType") or "").replace("claude_", ""), "note": ""}
+    tok, u = claude_token(svc), None
+    if tok:
+        try:
+            u = get("https://api.anthropic.com/api/oauth/usage", {"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
+        except Exception as e:
+            row["note"] = f"fetch failed: {str(e)[:40]}"
+    if u is None and cache and cache.get("accountUuid") == acct.get("accountUuid"):
+        u = cache.get("utilization")
+        row["note"] = row["note"] or "cached " + datetime.fromtimestamp(cache["fetchedAtMs"] / 1000).strftime("%H:%M") + ("" if tok else ", token expired")
+    if u is None:
+        row["note"] = row["note"] or "no live token; open a session once"
+        return row
+    fh, sd = u.get("five_hour") or {}, u.get("seven_day") or {}
+    row["5h"] = window(fh.get("utilization"), fh.get("resets_at"), 5 * 3600)
+    row["week"] = window(sd.get("utilization"), sd.get("resets_at"), 7 * 86400)
+    for l in u.get("limits") or []:
+        if l.get("kind") == "weekly_scoped" and (((l.get("scope") or {}).get("model") or {}).get("display_name") == "Fable"):
+            row["fable"] = window(l.get("percent"), l.get("resets_at"), 7 * 86400)
+    return row
+
+
+# ---------- Codex ----------
+def codex_profiles():
+    for d in [f"{HOME}/.codex"] + sorted(glob.glob(f"{HOME}/.codex-*/")):
+        try:
+            t = json.load(open(f"{d.rstrip('/')}/auth.json")).get("tokens") or {}
+        except Exception:
+            continue
+        if t.get("access_token"):
+            yield t
+
+
+def codex_usage(t):
+    claims = jwt(t.get("id_token") or t["access_token"])
+    auth = claims.get("https://api.openai.com/auth") or {}
+    row = {"provider": "codex", "name": claims.get("email") or "?", "plan": auth.get("chatgpt_plan_type") or "", "note": ""}
+    if jwt(t["access_token"]).get("exp", 0) < time.time():
+        row["note"] = "token expired; open a codex session once"
+        return row
+    try:
+        u = get("https://chatgpt.com/backend-api/wham/usage",
+                {"Authorization": f"Bearer {t['access_token']}", "ChatGPT-Account-Id": t.get("account_id") or auth.get("chatgpt_account_id", ""), "User-Agent": "limits/1"})
+    except Exception as e:
+        row["note"] = f"fetch failed: {str(e)[:40]}"
+        return row
+
+    def win(w):
+        if not w:
+            return None
+        ra = w.get("reset_at")
+        if not isinstance(ra, (int, float)) and w.get("reset_after_seconds") is not None:
+            ra = time.time() + w["reset_after_seconds"]
+        iso = datetime.fromtimestamp(ra, timezone.utc).isoformat() if isinstance(ra, (int, float)) else ra
+        return window(w.get("used_percent"), iso, w.get("limit_window_seconds"))
+
+    rl = u.get("rate_limit") or {}
+    # plans differ: some have a 5h + weekly pair, some only a weekly window; slot by length, not position
+    for w in (win(rl.get("primary_window")), win(rl.get("secondary_window"))):
+        if not w:
+            continue
+        slot = "5h" if (w.get("window_seconds") or 0) <= 6 * 3600 else "week"
+        row.setdefault(slot, w)
+    row["plan"] = u.get("plan_type") or row["plan"]
+    cr = u.get("credits") or {}
+    if cr:
+        row["note"] = "credits: " + ("unlimited" if cr.get("unlimited") else f"{cr.get('balance') or 0}" + ("" if cr.get("has_credits") else " (out)"))
+    return row
+
+
+# ---------- render ----------
+def bar(v, weekly=False, width=10):
+    if not v or v.get("pct") is None:
+        return "░" * width + "   n/a       "
+    p, iso = v["pct"], v.get("resets")
+    n = max(0, min(width, round(p / 100 * width)))
+    col = "\033[32m" if p < 50 else "\033[33m" if p < 80 else "\033[31m"
+    when = ""
+    if iso:
+        try:
+            dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone()
+            when = dt.strftime("%a %H:%M") if weekly else dt.strftime("%H:%M")
+        except Exception:
+            pass
+    return f"{col}{'█' * n}{'░' * (width - n)}\033[0m {p:3.0f}% {when:<9}"
+
+
+def render(rows):
+    out = []
+    for prov in ("claude", "codex"):
+        group = [r for r in rows if r["provider"] == prov]
+        if not group:
+            continue
+        out.append(f"\033[1m{prov.upper()}\033[0m")
+        for r in group:
+            name = f"{r['name']} ({r['plan']})" if r.get("plan") else r["name"]
+            line = f"  {name:<34} 5h {bar(r.get('5h'))}  wk {bar(r.get('week'), True)}"
+            if prov == "claude":
+                line += f"  Fable {bar(r.get('fable'), True)}"
+            if r.get("note"):
+                line += f"  \033[2m{r['note']}\033[0m"
+            out.append(line)
+    out.append(f"\033[2mupdated {datetime.now().strftime('%H:%M:%S')}\033[0m")
+    return "\n".join(out)
+
+
+def collect():
+    jobs = [(claude_usage, p) for p in claude_profiles()] + [(codex_usage, (t,)) for t in codex_profiles()]
+    with ThreadPoolExecutor(8) as ex:
+        return list(ex.map(lambda j: j[0](*j[1]), jobs))
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if "--json" in args:
+        print(json.dumps(collect(), indent=2))
+    elif "--watch" in args:
+        i = args.index("--watch")
+        every = int(args[i + 1]) if len(args) > i + 1 and args[i + 1].isdigit() else 300
+        try:
+            while True:
+                print("\033[2J\033[H" + render(collect()) + f"  every {every}s, ctrl-c to stop", flush=True)
+                time.sleep(every)
+        except KeyboardInterrupt:
+            pass
+    else:
+        print(render(collect()))

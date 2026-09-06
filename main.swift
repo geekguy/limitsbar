@@ -1,0 +1,217 @@
+// LimitsBar: menu bar view of 5h / weekly / Fable usage across all Claude Code and Codex
+// accounts, with reset countdowns. Data comes from ~/.local/bin/limits --json (the same
+// profiles the CLIs use). Build with ./build.sh; it produces ~/Applications/LimitsBar.app.
+import SwiftUI
+import AppKit
+
+struct Win: Decodable, Sendable {
+    var pct: Double?; var resets: String?; var resetsEpoch: Double?; var windowSeconds: Double?
+    enum CodingKeys: String, CodingKey { case pct, resets, resetsEpoch = "resets_epoch", windowSeconds = "window_seconds" }
+}
+struct Row: Decodable, Identifiable, Sendable {
+    var provider: String; var name: String; var plan: String?; var note: String?
+    var fiveH: Win?; var week: Win?; var fable: Win?
+    var id: String { provider + "|" + name }
+    enum CodingKeys: String, CodingKey { case provider, name, plan, note, fiveH = "5h", week, fable }
+}
+
+@MainActor final class Model: ObservableObject {
+    @Published var rows: [Row] = []
+    @Published var updated = "…"
+    @Published var error = ""
+    @Published var busy = false
+    private var timer: Timer?
+
+    init() {
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+    }
+
+    /// Menu bar text: lowest 5h usage per provider, i.e. the account with the most headroom.
+    var title: String {
+        func best(_ p: String) -> String {
+            let v = rows.filter { $0.provider == p }.compactMap { $0.fiveH?.pct }.min()
+            return v.map { "\(Int($0.rounded()))%" } ?? "–"
+        }
+        return "C \(best("claude")) · X \(best("codex"))"
+    }
+
+    func rows(for provider: String) -> [Row] {
+        rows.filter { $0.provider == provider }.sorted { ($0.fiveH?.pct ?? 999) < ($1.fiveH?.pct ?? 999) }
+    }
+
+    func refresh() {
+        guard !busy else { return }
+        busy = true
+        Task.detached {
+            let (rows, err) = Self.fetch()
+            await MainActor.run {
+                self.rows = rows; self.error = err; self.busy = false
+                self.updated = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+            }
+        }
+    }
+
+    nonisolated static func fetch() -> ([Row], String) {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let py = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: py)
+        p.arguments = [home + "/.local/bin/limits", "--json"]
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out; p.standardError = err
+        do { try p.run() } catch { return ([], "cannot run limits: \(error.localizedDescription)") }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        let edata = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        do { return (try JSONDecoder().decode([Row].self, from: data), "") } catch {
+            let msg = String(data: edata, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return ([], msg.isEmpty ? "limits returned no usable data" : String(msg.suffix(200)))
+        }
+    }
+}
+
+@main struct LimitsBarApp: App {
+    @StateObject private var model = Model()
+    var body: some Scene {
+        MenuBarExtra {
+            ContentView(model: model)
+        } label: {
+            HStack(spacing: 4) { Image(systemName: "gauge.medium"); Text(model.title).monospacedDigit() }
+        }
+        .menuBarExtraStyle(.window)
+    }
+}
+
+func usageColor(_ p: Double?) -> Color {
+    guard let p else { return .gray }
+    return p < 50 ? .green : p < 80 ? .orange : .red
+}
+
+func countdown(_ t: TimeInterval) -> String {
+    let s = Int(max(0, t)), d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+    if d > 0 { return "\(d)d \(h)h" }
+    if h > 0 { return "\(h)h \(m)m" }
+    return m > 0 ? "\(m)m" : "now"
+}
+
+struct ContentView: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        // re-render every minute so the countdowns stay current between fetches
+        TimelineView(.periodic(from: .now, by: 60)) { ctx in
+            VStack(alignment: .leading, spacing: 12) {
+                ProviderSection(title: "Claude", accent: .orange, rows: model.rows(for: "claude"), now: ctx.date)
+                ProviderSection(title: "Codex", accent: .teal, rows: model.rows(for: "codex"), now: ctx.date)
+                if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red) }
+                if model.rows.isEmpty && model.error.isEmpty {
+                    Text(model.busy ? "Loading…" : "No accounts found").font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                HStack {
+                    Text("Updated \(model.updated) · refreshes every 5 min").font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                    Button(model.busy ? "Refreshing…" : "Refresh") { model.refresh() }.disabled(model.busy)
+                    Button("Quit") { NSApp.terminate(nil) }
+                }
+            }
+            .padding(14)
+            .frame(width: 500)
+        }
+    }
+}
+
+struct ProviderSection: View {
+    let title: String; let accent: Color; let rows: [Row]; let now: Date
+    var body: some View {
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Circle().fill(accent).frame(width: 8, height: 8)
+                    Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(rows.count) account\(rows.count == 1 ? "" : "s") · most headroom first")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+                ForEach(rows) { RowView(row: $0, now: now) }
+            }
+        }
+    }
+}
+
+struct RowView: View {
+    let row: Row; let now: Date
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Circle().fill(usageColor(row.fiveH?.pct)).frame(width: 7, height: 7)
+                Text(row.name).font(.body.weight(.medium)).lineLimit(1).truncationMode(.middle)
+                if let p = row.plan, !p.isEmpty { Tag(text: p) }
+                Spacer()
+                if let n = row.note, !n.isEmpty {
+                    Text(n).font(.caption2).foregroundStyle(n.contains("(out)") || n.contains("expired") ? .red : .secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+            }
+            HStack(alignment: .top, spacing: 14) {
+                Bar(label: "5 hour", win: row.fiveH, weekly: false, now: now)
+                Bar(label: "Weekly", win: row.week, weekly: true, now: now)
+                if row.provider == "claude" { Bar(label: "Fable weekly", win: row.fable, weekly: true, now: now) }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
+    }
+}
+
+struct Tag: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(Color.primary.opacity(0.08)))
+    }
+}
+
+struct Bar: View {
+    let label: String; let win: Win?; let weekly: Bool; let now: Date
+    var body: some View {
+        let pct = win?.pct
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Text(label).font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                Text(pct.map { "\(Int($0.rounded()))%" } ?? "n/a").font(.caption.monospacedDigit().weight(.semibold))
+            }
+            ProgressView(value: min(max(pct ?? 0, 0), 100), total: 100).tint(usageColor(pct))
+            if let e = elapsed {
+                // timeline of the window itself: how far along it is until the reset
+                GeometryReader { g in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(.quaternary)
+                        Capsule().fill(.secondary).frame(width: g.size.width * e)
+                    }
+                }.frame(height: 3)
+            }
+            Text(resetText).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    var elapsed: Double? {
+        guard let r = win?.resetsEpoch, let w = win?.windowSeconds, w > 0 else { return nil }
+        return min(max(1 - (r - now.timeIntervalSince1970) / w, 0), 1)
+    }
+
+    var resetText: String {
+        guard win?.pct != nil else { return "not tracked" }
+        guard let r = win?.resetsEpoch else { return "" }
+        let date = Date(timeIntervalSince1970: r), rem = date.timeIntervalSince(now)
+        if rem <= 0 { return "resets now" }
+        let df = DateFormatter()
+        df.dateFormat = (weekly || rem > 86400) ? "EEE HH:mm" : "HH:mm"
+        return "resets in \(countdown(rem)) · \(df.string(from: date))"
+    }
+}
