@@ -99,6 +99,38 @@ struct Row: Decodable, Identifiable, Sendable {
         }
     }
 
+    struct AddResult { var provider: String; var message: String; var command: String }
+    @Published var addResult: AddResult?
+
+    /// Create a new profile dir via `limits add`; the browser sign-in itself has to run in a terminal.
+    func addAccount(_ provider: String, _ name: String) {
+        let n = name.trimmingCharacters(in: .whitespaces).lowercased()
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let py = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
+        let p = Process(); p.executableURL = URL(fileURLWithPath: py)
+        p.arguments = [home + "/.local/bin/limits", "add", provider, n]
+        let out = Pipe(); p.standardOutput = out; p.standardError = out
+        do { try p.run() } catch { addResult = AddResult(provider: provider, message: "cannot run limits: \(error.localizedDescription)", command: ""); return }
+        let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        p.waitUntilExit()
+        let ok = p.terminationStatus == 0
+        addResult = AddResult(provider: provider, message: ok ? "Created ~/.\(provider)-\(n). Sign in once, then it appears here:" : text,
+                              command: ok ? (provider == "claude" ? "claude-\(n) auth login" : "codex-\(n) login") : "")
+    }
+
+    func copyToClipboard(_ s: String) {
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string)
+    }
+
+    /// Opens Terminal.app with the command; the login shell there defines the new wrapper from the profile dir.
+    func runInTerminal(_ cmd: String) {
+        let quoted = cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        var err: NSDictionary?
+        NSAppleScript(source: "tell application \"Terminal\"\nactivate\ndo script \"\(quoted)\"\nend tell")?.executeAndReturnError(&err)
+        if let e = err { self.error = "Terminal: \(e[NSAppleScript.errorMessage] ?? "could not run the command; copy it instead")" }
+    }
+
     func setLoginItem(_ on: Bool) {
         do {
             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
@@ -196,8 +228,8 @@ struct ContentView: View {
         // re-render every minute so the countdowns stay current between fetches
         TimelineView(.periodic(from: .now, by: 60)) { ctx in
             VStack(alignment: .leading, spacing: 12) {
-                ProviderSection(title: "Claude", accent: .orange, rows: model.rows(for: "claude"), now: ctx.date, makePrimary: model.setPrimary)
-                ProviderSection(title: "Codex", accent: .teal, rows: model.rows(for: "codex"), now: ctx.date, makePrimary: model.setPrimary)
+                ProviderSection(model: model, provider: "claude", title: "Claude", accent: .orange, now: ctx.date)
+                ProviderSection(model: model, provider: "codex", title: "Codex", accent: .teal, now: ctx.date)
                 if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red) }
                 if model.rows.isEmpty && model.error.isEmpty {
                     Text(model.busy ? "Loading…" : "No accounts found").font(.caption).foregroundStyle(.secondary)
@@ -221,19 +253,38 @@ struct ContentView: View {
 }
 
 struct ProviderSection: View {
-    let title: String; let accent: Color; let rows: [Row]; let now: Date; let makePrimary: (Row) -> Void
+    @ObservedObject var model: Model
+    let provider: String; let title: String; let accent: Color; let now: Date
+    @State private var adding = false
+    @State private var newName = ""
     var body: some View {
-        if !rows.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    Circle().fill(accent).frame(width: 8, height: 8)
-                    Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Spacer()
-                    Text("\(rows.count) account\(rows.count == 1 ? "" : "s") · most headroom first")
-                        .font(.caption2).foregroundStyle(.tertiary)
-                }
-                ForEach(rows) { r in RowView(row: r, now: now, makePrimary: { makePrimary(r) }) }
+        let rows = model.rows(for: provider)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Circle().fill(accent).frame(width: 8, height: 8)
+                Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Text("\(rows.count) account\(rows.count == 1 ? "" : "s") · most headroom first").font(.caption2).foregroundStyle(.tertiary)
+                Button(adding ? "cancel" : "add account…") { adding.toggle(); model.addResult = nil }.buttonStyle(.link).font(.caption2)
             }
+            if adding {
+                HStack(spacing: 6) {
+                    TextField("short name, e.g. work", text: $newName).textFieldStyle(.roundedBorder).font(.caption)
+                        .onSubmit { model.addAccount(provider, newName) }
+                    Button("Create") { model.addAccount(provider, newName) }.disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                if let r = model.addResult, r.provider == provider {
+                    Text(r.message).font(.caption2).foregroundStyle(r.command.isEmpty ? .red : .secondary)
+                    if !r.command.isEmpty {
+                        HStack(spacing: 8) {
+                            Text(r.command).font(.caption.monospaced()).textSelection(.enabled)
+                            Button("Copy") { model.copyToClipboard(r.command) }.font(.caption2)
+                            Button("Run in Terminal") { model.runInTerminal(r.command) }.font(.caption2)
+                        }
+                    }
+                }
+            }
+            ForEach(rows) { r in RowView(row: r, now: now, makePrimary: { model.setPrimary(r) }) }
         }
     }
 }

@@ -16,6 +16,7 @@ cat > "$app/Contents/Info.plist" <<'EOF'
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>Opens Terminal to run the sign-in command for a newly added account.</string>
 </dict></plist>
 EOF
 codesign -s - -f "$app" >/dev/null 2>&1 || true

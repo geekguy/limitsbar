@@ -2,12 +2,13 @@
 """limits — 5h / weekly / Fable usage across every Claude Code and Codex account.
 
 usage: limits [--watch [SECONDS]] [--json]
+       limits add <claude|codex> <name>     # create ~/.<provider>-<name>, then sign in once
 
 Claude: one profile per ~/.claude and ~/.claude-*; the token comes from the same Keychain
         item the CLI uses, and the CLI's own cached usage is shown when the token is expired.
 Codex:  one profile per ~/.codex and ~/.codex-*; the token comes from auth.json.
 """
-import base64, glob, hashlib, json, os, subprocess, sys, time, urllib.error, urllib.request
+import base64, glob, hashlib, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -190,6 +191,50 @@ def codex_usage(d, t):
     return row
 
 
+# ---------- profiles ----------
+CLAUDE_SHARED = ["agents", "CLAUDE.md", "commands", "history.jsonl", "keybindings.json", "plans", "plugins", "projects",
+                 "RTK.md", "settings.json", "settings.local.json", "skills", "tasks", "todos"]
+
+
+def add_profile(provider, name):
+    """Create ~/.<provider>-<name>: shared state symlinked to the base dir, identity kept per profile.
+    Claude copies the symlink set of an existing sibling profile (so all profiles stay alike); Codex shares
+    every directory. The CLI then needs one interactive sign-in: `claude-<name> auth login` / `codex-<name> login`."""
+    if provider not in ("claude", "codex") or not re.fullmatch(r"[a-z0-9-]+", name or ""):
+        sys.exit("usage: limits add <claude|codex> <name>   (name: a-z, 0-9, -)")
+    base, d = f"{HOME}/.{provider}", f"{HOME}/.{provider}-{name}"
+    if os.path.exists(d):
+        sys.exit(f"{d} already exists")
+    os.mkdir(d)
+    if provider == "claude":
+        siblings = [s.rstrip("/") for s in glob.glob(f"{HOME}/.claude-*/") if os.path.isfile(f"{s}/.claude.json")]
+        links = ({e: os.readlink(f"{siblings[0]}/{e}") for e in os.listdir(siblings[0]) if os.path.islink(f"{siblings[0]}/{e}")}
+                 if siblings else {e: f"{base}/{e}" for e in CLAUDE_SHARED})
+        for e, target in links.items():
+            os.symlink(target, f"{d}/{e}")
+        try:   # seed settings and trust from the default profile, minus identity and caches, so the CLI goes straight to sign-in
+            c = json.load(open(f"{HOME}/.claude.json"))
+            for k in ["oauthAccount", "cachedUsageUtilization", "clientDataCacheSlots", "modelAccessCache", "additionalModelOptionsCache",
+                      "additionalModelOptionsAnsweredAt", "additionalModelCostsCache", "orgModelDefaultCache", "autoCompactWindowsCache",
+                      "cachedExtraUsageDisabledReason"]:
+                c.pop(k, None)
+            with os.fdopen(os.open(f"{d}/.claude.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+                json.dump(c, f)
+        except Exception:
+            pass
+        cmd = f"claude-{name} auth login"
+    else:
+        for e in os.listdir(base):
+            p = f"{base}/{e}"
+            if (os.path.isdir(p) and not os.path.islink(p)) or e == "history.jsonl":
+                os.symlink(p, f"{d}/{e}")
+        for e in ["config.toml", ".codex-global-state.json"]:   # rewritten atomically by Codex, so copies rather than links
+            if os.path.exists(f"{base}/{e}"):
+                shutil.copy2(f"{base}/{e}", f"{d}/{e}")
+        cmd = f"codex-{name} login"
+    print(f"created {d}\nsign in from a new terminal with: {cmd}")
+
+
 # ---------- render ----------
 def bar(v, weekly=False, width=10):
     if not v or v.get("pct") is None:
@@ -236,7 +281,9 @@ def collect():
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--json" in args:
+    if args[:1] == ["add"]:
+        add_profile(args[1] if len(args) > 1 else "", args[2] if len(args) > 2 else "")
+    elif "--json" in args:
         print(json.dumps(collect(), indent=2))
     elif "--watch" in args:
         i = args.index("--watch")

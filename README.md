@@ -18,6 +18,10 @@ It reads the same profiles the CLIs use, so there is nothing to configure:
 - **Claude Code:** `~/.claude` plus any `~/.claude-*` config dir (the `CLAUDE_CONFIG_DIR` convention). The token comes from the Keychain item the CLI stores for that dir; if it has expired, the CLI's own cached usage is shown instead.
 - **Codex:** `~/.codex` plus any `~/.codex-*` dir (the `CODEX_HOME` convention), via each dir's `auth.json`.
 
+## Adding an account
+
+**add account…** in a provider header creates a new profile dir (`~/.claude-<name>` or `~/.codex-<name>`) laid out like the existing ones: shared state symlinked to the base dir, identity kept per profile. It then shows the one interactive sign-in command, `claude-<name> auth login` or `codex-<name> login`, with Copy and Run in Terminal. The same thing from a shell: `limits add claude <name>` / `limits add codex <name>`. A shell wrapper that defines `claude-<name>` / `codex-<name>` from the profile dirs makes those commands exist in any new terminal.
+
 ## Install
 
 Requirements: macOS 14+, Xcode command line tools (`swiftc`), `python3`.
