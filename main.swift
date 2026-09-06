@@ -55,8 +55,27 @@ struct Row: Decodable, Identifiable, Sendable {
 struct Session: Decodable, Identifiable, Sendable {
     var provider: String; var pid: Int; var dir: String; var account: String; var name: String; var cwd: String
     var active: Bool?; var startedEpoch: Double   // active is nil where the tool exposes no idle/busy state (Codex)
+    var tty: String?; var sessionId: String?
     var id: String { "\(provider)|\(pid)" }
-    enum CodingKeys: String, CodingKey { case provider, pid, dir, account, name, cwd, active, startedEpoch = "started_epoch" }
+    enum CodingKeys: String, CodingKey { case provider, pid, dir, account, name, cwd, active, startedEpoch = "started_epoch", tty, sessionId = "session_id" }
+}
+
+/// A ScrollView that hugs its content up to a maximum height, so the popover only scrolls when it must.
+struct HuggingScroll<Content: View>: View {
+    let maxHeight: CGFloat
+    @ViewBuilder let content: () -> Content
+    @State private var contentHeight: CGFloat = 0
+    var body: some View {
+        ScrollView(.vertical) {
+            content().background(GeometryReader { g in Color.clear.preference(key: HeightKey.self, value: g.size.height) })
+        }
+        .onPreferenceChange(HeightKey.self) { contentHeight = $0 }
+        .frame(height: contentHeight > 0 ? min(contentHeight, maxHeight) : nil)
+    }
+}
+struct HeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 struct Payload: Decodable, Sendable { var accounts: [Row]; var sessions: [Session] }
 
@@ -156,6 +175,48 @@ struct Payload: Decodable, Sendable { var accounts: [Row]; var sessions: [Sessio
         let ok = p.terminationStatus == 0
         addResult = AddResult(provider: provider, message: ok ? "Created ~/.\(provider)-\(n). Sign in once, then it appears here:" : text,
                               command: ok ? (provider == "claude" ? "claude-\(n) auth login" : "codex-\(n) login") : "")
+    }
+
+    /// Bring the session's terminal tab to the front (iTerm, matched by tty). Every listed session is a live
+    /// process, so a second `--resume` would double up on its transcript; if no tab is found, hand over the
+    /// resume command instead for the case where the terminal is gone.
+    func focusSession(_ s: Session) {
+        if let tty = s.tty, !tty.isEmpty {
+            let script = """
+            tell application "iTerm2"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  repeat with se in sessions of t
+                    if tty of se is "/dev/\(tty)" then
+                      select t
+                      select se
+                      set index of w to 1
+                      activate
+                      return true
+                    end if
+                  end repeat
+                end repeat
+              end repeat
+            end tell
+            return false
+            """
+            var err: NSDictionary?
+            if NSAppleScript(source: script)?.executeAndReturnError(&err).booleanValue == true { return }
+        }
+        let cmd = resumeCommand(s)
+        copyToClipboard(cmd)
+        error = "No iTerm tab found for \(s.name); resume command copied to the clipboard."
+    }
+
+    func resumeCommand(_ s: Session) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let cd = s.cwd.isEmpty ? "" : "cd '\(s.cwd)' && "
+        if s.provider == "claude" {
+            let env = s.dir == home + "/.claude" ? "CLAUDE_USE_DEFAULT=1 " : "CLAUDE_CONFIG_DIR='\(s.dir)' "
+            return cd + env + "claude --resume \(s.sessionId ?? "")"
+        }
+        let env = s.dir == home + "/.codex" ? "CODEX_USE_DEFAULT=1 " : "CODEX_HOME='\(s.dir)' "
+        return cd + env + "codex resume \((s.sessionId ?? "").isEmpty ? "--last" : s.sessionId!)"
     }
 
     func copyToClipboard(_ s: String) {
@@ -268,13 +329,18 @@ struct ContentView: View {
         // re-render every minute so the countdowns stay current between fetches
         TimelineView(.periodic(from: .now, by: 60)) { ctx in
             VStack(alignment: .leading, spacing: 12) {
-                ProviderSection(model: model, provider: "claude", title: "Claude", accent: .orange, now: ctx.date)
-                ProviderSection(model: model, provider: "codex", title: "Codex", accent: .teal, now: ctx.date)
-                if !model.sessions.isEmpty { SessionsSection(sessions: model.sessions, now: ctx.date) }
-                if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red) }
-                if model.rows.isEmpty && model.error.isEmpty {
-                    Text(model.busy ? "Loading…" : "No accounts found").font(.caption).foregroundStyle(.secondary)
+                // body scrolls within the screen; the footer stays pinned
+                HuggingScroll(maxHeight: (NSScreen.main?.visibleFrame.height ?? 800) - 140) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ProviderSection(model: model, provider: "claude", title: "Claude", accent: .orange, now: ctx.date)
+                        ProviderSection(model: model, provider: "codex", title: "Codex", accent: .teal, now: ctx.date)
+                        if !model.sessions.isEmpty { SessionsSection(model: model, now: ctx.date) }
+                        if model.rows.isEmpty && model.error.isEmpty {
+                            Text(model.busy ? "Loading…" : "No accounts found").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 }
+                if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red).lineLimit(2) }
                 Divider()
                 HStack(spacing: 10) {
                     Text("Updated \(model.updated) · ⌘⇧L toggles").font(.caption2).foregroundStyle(.secondary)
@@ -335,16 +401,22 @@ struct ProviderSection: View {
 
 /// Every running interactive session, attributed to its account: what is burning which limit, and what to close.
 struct SessionsSection: View {
-    let sessions: [Session]; let now: Date
+    @ObservedObject var model: Model
+    let now: Date
     @State private var open = false
+    @State private var search = ""
     var body: some View {
+        let sessions = model.sessions
         let active = sessions.filter { $0.active == true }.count
-        let sorted = sessions.sorted {
-            ($0.account, $0.active == true ? 0 : 1, -$0.startedEpoch) < ($1.account, $1.active == true ? 0 : 1, -$1.startedEpoch)
-        }
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        let shown = sessions
+            .filter { q.isEmpty || $0.name.lowercased().contains(q) || $0.cwd.lowercased().contains(q) || $0.account.lowercased().contains(q) }
+            .sorted { ($0.account, $0.active == true ? 0 : 1, -$0.startedEpoch) < ($1.account, $1.active == true ? 0 : 1, -$1.startedEpoch) }
         DisclosureGroup(isExpanded: $open) {
             VStack(alignment: .leading, spacing: 3) {
-                ForEach(sorted) { s in
+                TextField("filter by name, folder or account", text: $search).textFieldStyle(.roundedBorder).font(.caption)
+                    .padding(.bottom, 2)
+                ForEach(shown) { s in
                     HStack(spacing: 6) {
                         Circle().fill(s.active == true ? Color.green : s.active == nil ? Color.teal.opacity(0.6) : Color.gray.opacity(0.5))
                             .frame(width: 6, height: 6)
@@ -354,8 +426,11 @@ struct SessionsSection: View {
                             .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.head)
                         Spacer(minLength: 4)
                         Text(countdown(now.timeIntervalSince1970 - s.startedEpoch)).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        Button("open") { model.focusSession(s) }.buttonStyle(.link).font(.caption2)
+                            .help("Bring its terminal tab to the front (iTerm); otherwise copies the resume command")
                     }
                 }
+                if shown.isEmpty { Text("no match").font(.caption2).foregroundStyle(.tertiary) }
             }
             .padding(.top, 4)
         } label: {

@@ -236,14 +236,30 @@ def add_profile(provider, name):
 
 
 # ---------- sessions ----------
-def proc_env(pid, key):
-    """Value of an env var in one of our running processes (ps -E appends the environment to args)."""
+def proc_info(pid, key):
+    """(tty, value of env var `key`) for one of our running processes; ps -E appends the environment to args."""
     try:
-        args = subprocess.run(["ps", "-wwE", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout
+        line = subprocess.run(["ps", "-wwE", "-o", "tty=,args=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     except Exception:
-        return None
+        return "", None
+    tty, _, args = line.partition(" ")
     m = re.search(rf"(?:^| ){re.escape(key)}=(\S+)", args)
-    return m.group(1) if m else None
+    return ("" if tty in ("", "??", "-") else tty), (m.group(1) if m else None)
+
+
+def open_paths(pid):
+    """{fd: path} from lsof, e.g. 'cwd' and the rollout file a Codex TUI keeps open."""
+    try:
+        out = subprocess.run(["lsof", "-p", str(pid), "-Fpfn"], capture_output=True, text=True).stdout
+    except Exception:
+        return {}
+    paths, fd = {}, None
+    for l in out.splitlines():
+        if l.startswith("f"):
+            fd = l[1:]
+        elif l.startswith("n") and fd is not None:
+            paths[fd] = l[1:]
+    return paths
 
 
 def etime_seconds(s):
@@ -276,10 +292,12 @@ def sessions():
         if pid in seen or s.get("kind", "interactive") != "interactive" or not comm(pid).endswith("claude"):
             continue
         seen.add(pid)
-        d = proc_env(pid, "CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
+        tty, d = proc_info(pid, "CLAUDE_CONFIG_DIR")
+        d = d or f"{HOME}/.claude"
         out.append({"provider": "claude", "pid": pid, "dir": d, "account": claude_email.get(d, "?"),
                     "name": s.get("name") or os.path.basename(s.get("cwd", "")), "cwd": s.get("cwd", ""),
-                    "active": s.get("status", "idle") != "idle", "started_epoch": int(s.get("startedAt", 0)) / 1000})
+                    "active": s.get("status", "idle") != "idle", "started_epoch": int(s.get("startedAt", 0)) / 1000,
+                    "tty": tty, "session_id": s.get("sessionId", "")})
     # Codex: the native TUI binary (child of the node shim); helpers such as app-server carry a subcommand
     try:
         ps = subprocess.run(["ps", "-axwwo", "pid=,etime=,args="], capture_output=True, text=True).stdout
@@ -294,14 +312,14 @@ def sessions():
         if sub and not sub.startswith("-") and sub not in ("resume", "fork"):
             continue
         pid, age = int(parts[0]), etime_seconds(parts[1])
-        d = proc_env(pid, "CODEX_HOME") or f"{HOME}/.codex"
-        try:
-            lsof = subprocess.run(["lsof", "-p", str(pid), "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True).stdout
-            cwd = next((l[1:] for l in lsof.splitlines() if l.startswith("n")), "")
-        except Exception:
-            cwd = ""
+        tty, d = proc_info(pid, "CODEX_HOME")
+        d = d or f"{HOME}/.codex"
+        paths = open_paths(pid)
+        cwd = paths.get("cwd", "")
+        rollout = next((p for p in paths.values() if "/rollout-" in p and p.endswith(".jsonl")), "")
+        m = re.search(r"-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$", rollout)
         out.append({"provider": "codex", "pid": pid, "dir": d, "account": codex_email.get(d, "?"), "name": os.path.basename(cwd) or "codex",
-                    "cwd": cwd, "active": None, "started_epoch": time.time() - age})
+                    "cwd": cwd, "active": None, "started_epoch": time.time() - age, "tty": tty, "session_id": m.group(1) if m else ""})
     return out
 
 
