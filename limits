@@ -25,6 +25,15 @@ def jwt(tok):
     return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
 
 
+def primary_dir(base):
+    """Profile dir the bare `claude`/`codex` command opens: <base>/.primary names it; empty or missing = base itself."""
+    try:
+        p = open(f"{base}/.primary").read().strip()
+    except Exception:
+        p = ""
+    return p or base
+
+
 def window(pct, resets_iso, seconds):
     """One rate-limit window; epoch + window length let the UI draw a reset countdown/timeline."""
     try:
@@ -48,7 +57,7 @@ def claude_profiles():
             continue
         # same service-name rule as the CLI: suffix = sha256(config dir)[:8] for non-default dirs
         svc = "Claude Code-credentials" + ("" if d == f"{HOME}/.claude" else "-" + hashlib.sha256(d.encode()).hexdigest()[:8])
-        yield acct, svc, c.get("cachedUsageUtilization")
+        yield d, acct, svc, c.get("cachedUsageUtilization")
 
 
 def claude_token(svc):
@@ -59,8 +68,9 @@ def claude_token(svc):
     return t.get("accessToken") if t.get("expiresAt", 0) / 1000 > time.time() else None
 
 
-def claude_usage(acct, svc, cache):
-    row = {"provider": "claude", "name": acct["emailAddress"], "plan": (acct.get("organizationType") or "").replace("claude_", ""), "note": ""}
+def claude_usage(d, acct, svc, cache):
+    row = {"provider": "claude", "name": acct["emailAddress"], "plan": (acct.get("organizationType") or "").replace("claude_", ""), "note": "",
+           "dir": d, "primary": primary_dir(f"{HOME}/.claude") == d}
     tok, u = claude_token(svc), None
     if tok:
         try:
@@ -85,18 +95,20 @@ def claude_usage(acct, svc, cache):
 # ---------- Codex ----------
 def codex_profiles():
     for d in [f"{HOME}/.codex"] + sorted(glob.glob(f"{HOME}/.codex-*/")):
+        d = d.rstrip("/")
         try:
-            t = json.load(open(f"{d.rstrip('/')}/auth.json")).get("tokens") or {}
+            t = json.load(open(f"{d}/auth.json")).get("tokens") or {}
         except Exception:
             continue
         if t.get("access_token"):
-            yield t
+            yield d, t
 
 
-def codex_usage(t):
+def codex_usage(d, t):
     claims = jwt(t.get("id_token") or t["access_token"])
     auth = claims.get("https://api.openai.com/auth") or {}
-    row = {"provider": "codex", "name": claims.get("email") or "?", "plan": auth.get("chatgpt_plan_type") or "", "note": ""}
+    row = {"provider": "codex", "name": claims.get("email") or "?", "plan": auth.get("chatgpt_plan_type") or "", "note": "",
+           "dir": d, "primary": primary_dir(f"{HOME}/.codex") == d}
     if jwt(t["access_token"]).get("exp", 0) < time.time():
         row["note"] = "token expired; open a codex session once"
         return row
@@ -166,7 +178,7 @@ def render(rows):
             continue
         out.append(f"\033[1m{prov.upper()}\033[0m")
         for r in group:
-            name = f"{r['name']} ({r['plan']})" if r.get("plan") else r["name"]
+            name = ("★ " if r.get("primary") else "  ") + (f"{r['name']} ({r['plan']})" if r.get("plan") else r["name"])
             line = f"  {name:<34} 5h {bar(r.get('5h'))}  wk {bar(r.get('week'), True)}"
             if prov == "claude":
                 line += f"  Fable {bar(r.get('fable'), True)}"
@@ -180,7 +192,7 @@ def render(rows):
 
 
 def collect():
-    jobs = [(claude_usage, p) for p in claude_profiles()] + [(codex_usage, (t,)) for t in codex_profiles()]
+    jobs = [(claude_usage, p) for p in claude_profiles()] + [(codex_usage, p) for p in codex_profiles()]
     with ThreadPoolExecutor(8) as ex:
         return list(ex.map(lambda j: j[0](*j[1]), jobs))
 

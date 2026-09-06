@@ -16,8 +16,9 @@ struct Row: Decodable, Identifiable, Sendable {
     var provider: String; var name: String; var plan: String?; var note: String?
     var fiveH: Win?; var week: Win?; var fable: Win?
     var limitResets: LimitResets?
+    var dir: String?; var primary: Bool?   // profile dir, and whether the bare `claude`/`codex` command opens it
     var id: String { provider + "|" + name }
-    enum CodingKeys: String, CodingKey { case provider, name, plan, note, fiveH = "5h", week, fable, limitResets = "limit_resets" }
+    enum CodingKeys: String, CodingKey { case provider, name, plan, note, fiveH = "5h", week, fable, limitResets = "limit_resets", dir, primary }
 }
 
 @MainActor final class Model: ObservableObject {
@@ -47,6 +48,15 @@ struct Row: Decodable, Identifiable, Sendable {
         // headroom = 5h usage, or weekly usage on plans without a 5h window
         rows.filter { $0.provider == provider }
             .sorted { ($0.fiveH?.pct ?? $0.week?.pct ?? 999) < ($1.fiveH?.pct ?? $1.week?.pct ?? 999) }
+    }
+
+    /// Write <base>/.primary so the bare `claude`/`codex` wrapper opens this profile next time.
+    func setPrimary(_ row: Row) {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let base = home + (row.provider == "claude" ? "/.claude" : "/.codex")
+        let content = (row.dir == nil || row.dir == base) ? "" : row.dir! + "\n"
+        try? content.write(toFile: base + "/.primary", atomically: true, encoding: .utf8)
+        refresh()
     }
 
     func refresh() {
@@ -120,8 +130,8 @@ struct ContentView: View {
         // re-render every minute so the countdowns stay current between fetches
         TimelineView(.periodic(from: .now, by: 60)) { ctx in
             VStack(alignment: .leading, spacing: 12) {
-                ProviderSection(title: "Claude", accent: .orange, rows: model.rows(for: "claude"), now: ctx.date)
-                ProviderSection(title: "Codex", accent: .teal, rows: model.rows(for: "codex"), now: ctx.date)
+                ProviderSection(title: "Claude", accent: .orange, rows: model.rows(for: "claude"), now: ctx.date, makePrimary: model.setPrimary)
+                ProviderSection(title: "Codex", accent: .teal, rows: model.rows(for: "codex"), now: ctx.date, makePrimary: model.setPrimary)
                 if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red) }
                 if model.rows.isEmpty && model.error.isEmpty {
                     Text(model.busy ? "Loading…" : "No accounts found").font(.caption).foregroundStyle(.secondary)
@@ -142,7 +152,7 @@ struct ContentView: View {
 }
 
 struct ProviderSection: View {
-    let title: String; let accent: Color; let rows: [Row]; let now: Date
+    let title: String; let accent: Color; let rows: [Row]; let now: Date; let makePrimary: (Row) -> Void
     var body: some View {
         if !rows.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
@@ -153,20 +163,26 @@ struct ProviderSection: View {
                     Text("\(rows.count) account\(rows.count == 1 ? "" : "s") · most headroom first")
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
-                ForEach(rows) { RowView(row: $0, now: now) }
+                ForEach(rows) { r in RowView(row: r, now: now, makePrimary: { makePrimary(r) }) }
             }
         }
     }
 }
 
 struct RowView: View {
-    let row: Row; let now: Date
+    let row: Row; let now: Date; let makePrimary: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Circle().fill(usageColor(row.fiveH?.pct ?? row.week?.pct)).frame(width: 7, height: 7)
                 Text(row.name).font(.body.weight(.medium)).lineLimit(1).truncationMode(.middle)
                 if let p = row.plan, !p.isEmpty { Tag(text: p) }
+                if row.primary == true {
+                    Tag(text: "primary", accent: true)
+                } else if row.dir != nil {
+                    Button("make primary", action: makePrimary).buttonStyle(.link).font(.caption2)
+                        .help("Bare `\(row.provider)` opens this account next time; running sessions are unaffected")
+                }
                 if let lr = row.limitResets, let a = lr.available {
                     let usable = lr.usableNow ?? 0
                     Tag(text: "\(a) limit reset\(a == 1 ? "" : "s")" + (usable > 0 ? " · \(usable) usable now" : ""))
@@ -192,10 +208,11 @@ struct RowView: View {
 }
 
 struct Tag: View {
-    let text: String
+    let text: String; var accent = false
     var body: some View {
-        Text(text).font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
-            .background(Capsule().fill(Color.primary.opacity(0.08)))
+        Text(text).font(.caption2.weight(accent ? .semibold : .regular)).padding(.horizontal, 6).padding(.vertical, 2)
+            .foregroundStyle(accent ? Color.accentColor : Color.primary)
+            .background(Capsule().fill(accent ? Color.accentColor.opacity(0.15) : Color.primary.opacity(0.08)))
     }
 }
 
