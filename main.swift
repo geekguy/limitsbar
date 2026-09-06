@@ -8,11 +8,21 @@ struct Win: Decodable, Sendable {
     var pct: Double?; var resets: String?; var resetsEpoch: Double?; var windowSeconds: Double?
     enum CodingKeys: String, CodingKey { case pct, resets, resetsEpoch = "resets_epoch", windowSeconds = "window_seconds" }
 }
+struct LimitResets: Decodable, Sendable {
+    var available: Int?; var usableNow: Int?
+    enum CodingKeys: String, CodingKey { case available, usableNow = "usable_now" }
+}
+struct Extra: Decodable, Identifiable, Sendable {
+    var name: String; var fiveH: Win?; var week: Win?
+    var id: String { name }
+    enum CodingKeys: String, CodingKey { case name, fiveH = "5h", week }
+}
 struct Row: Decodable, Identifiable, Sendable {
     var provider: String; var name: String; var plan: String?; var note: String?
     var fiveH: Win?; var week: Win?; var fable: Win?
+    var limitResets: LimitResets?; var extra: [Extra]?
     var id: String { provider + "|" + name }
-    enum CodingKeys: String, CodingKey { case provider, name, plan, note, fiveH = "5h", week, fable }
+    enum CodingKeys: String, CodingKey { case provider, name, plan, note, fiveH = "5h", week, fable, limitResets = "limit_resets", extra }
 }
 
 @MainActor final class Model: ObservableObject {
@@ -39,7 +49,9 @@ struct Row: Decodable, Identifiable, Sendable {
     }
 
     func rows(for provider: String) -> [Row] {
-        rows.filter { $0.provider == provider }.sorted { ($0.fiveH?.pct ?? 999) < ($1.fiveH?.pct ?? 999) }
+        // headroom = 5h usage, or weekly usage on plans without a 5h window
+        rows.filter { $0.provider == provider }
+            .sorted { ($0.fiveH?.pct ?? $0.week?.pct ?? 999) < ($1.fiveH?.pct ?? $1.week?.pct ?? 999) }
     }
 
     func refresh() {
@@ -120,6 +132,7 @@ struct ContentView: View {
             }
             .padding(14)
             .frame(width: 500)
+            .background(Color(nsColor: .windowBackgroundColor))   // opaque, so no terminal bleeds through
         }
     }
 }
@@ -147,9 +160,13 @@ struct RowView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                Circle().fill(usageColor(row.fiveH?.pct)).frame(width: 7, height: 7)
+                Circle().fill(usageColor(row.fiveH?.pct ?? row.week?.pct)).frame(width: 7, height: 7)
                 Text(row.name).font(.body.weight(.medium)).lineLimit(1).truncationMode(.middle)
                 if let p = row.plan, !p.isEmpty { Tag(text: p) }
+                if let lr = row.limitResets, let a = lr.available {
+                    let usable = lr.usableNow ?? 0
+                    Tag(text: "\(a) limit reset\(a == 1 ? "" : "s")" + (usable > 0 ? " · \(usable) usable now" : ""))
+                }
                 Spacer()
                 if let n = row.note, !n.isEmpty {
                     Text(n).font(.caption2).foregroundStyle(n.contains("(out)") || n.contains("expired") ? .red : .secondary)
@@ -159,7 +176,16 @@ struct RowView: View {
             HStack(alignment: .top, spacing: 14) {
                 Bar(label: "5 hour", win: row.fiveH, weekly: false, now: now)
                 Bar(label: "Weekly", win: row.week, weekly: true, now: now)
-                if row.provider == "claude" { Bar(label: "Fable weekly", win: row.fable, weekly: true, now: now) }
+                if row.fable != nil { Bar(label: "Fable weekly", win: row.fable, weekly: true, now: now) }   // Max plans only
+            }
+            ForEach(row.extra ?? []) { e in   // per-model limits on top of the account limit
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(e.name).font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                    HStack(alignment: .top, spacing: 14) {
+                        Bar(label: "5 hour", win: e.fiveH, weekly: false, now: now)
+                        Bar(label: "Weekly", win: e.week, weekly: true, now: now)
+                    }
+                }
             }
         }
         .padding(10)
@@ -206,8 +232,8 @@ struct Bar: View {
     }
 
     var resetText: String {
-        guard win?.pct != nil else { return "not tracked" }
-        guard let r = win?.resetsEpoch else { return "" }
+        guard win?.pct != nil else { return "not tracked on this plan" }
+        guard let r = win?.resetsEpoch else { return "no reset time reported" }
         let date = Date(timeIntervalSince1970: r), rem = date.timeIntervalSince(now)
         if rem <= 0 { return "resets now" }
         let df = DateFormatter()

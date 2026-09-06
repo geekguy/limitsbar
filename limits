@@ -116,17 +116,26 @@ def codex_usage(t):
         iso = datetime.fromtimestamp(ra, timezone.utc).isoformat() if isinstance(ra, (int, float)) else ra
         return window(w.get("used_percent"), iso, w.get("limit_window_seconds"))
 
-    rl = u.get("rate_limit") or {}
-    # plans differ: some have a 5h + weekly pair, some only a weekly window; slot by length, not position
-    for w in (win(rl.get("primary_window")), win(rl.get("secondary_window"))):
-        if not w:
-            continue
-        slot = "5h" if (w.get("window_seconds") or 0) <= 6 * 3600 else "week"
-        row.setdefault(slot, w)
+    def slots(rl):
+        # plans differ: some have a 5h + weekly pair, some only a weekly window; slot by length, not position
+        out = {}
+        for w in (win(rl.get("primary_window")), win(rl.get("secondary_window"))):
+            if w:
+                out.setdefault("5h" if (w.get("window_seconds") or 0) <= 6 * 3600 else "week", w)
+        return out
+
+    row.update(slots(u.get("rate_limit") or {}))
     row["plan"] = u.get("plan_type") or row["plan"]
     cr = u.get("credits") or {}
     if cr:
         row["note"] = "credits: " + ("unlimited" if cr.get("unlimited") else f"{cr.get('balance') or 0}" + ("" if cr.get("has_credits") else " (out)"))
+    rc = u.get("rate_limit_reset_credits") or {}
+    if rc.get("available_count") is not None:   # Codex perk: reset a hit limit early
+        row["limit_resets"] = {"available": rc.get("available_count"), "usable_now": rc.get("applicable_available_count")}
+    extra = [{"name": a.get("limit_name") or a.get("metered_feature") or "extra", **slots(a.get("rate_limit") or {})}
+             for a in u.get("additional_rate_limits") or []]
+    if extra:   # per-model limits some plans carry on top of the account limit
+        row["extra"] = extra
     return row
 
 
@@ -159,6 +168,8 @@ def render(rows):
             line = f"  {name:<34} 5h {bar(r.get('5h'))}  wk {bar(r.get('week'), True)}"
             if prov == "claude":
                 line += f"  Fable {bar(r.get('fable'), True)}"
+            if r.get("limit_resets"):
+                line += f"  resets:{r['limit_resets'].get('available')}"
             if r.get("note"):
                 line += f"  \033[2m{r['note']}\033[0m"
             out.append(line)
