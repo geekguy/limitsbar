@@ -1,3 +1,5 @@
+pkill -x LimitsBar 2>/dev/null || true
+while pgrep -x LimitsBar >/dev/null; do sleep 0.2; done   # let the old instance exit first; `open` fails with -600 otherwise
 #!/bin/bash
 # Builds ~/Applications/LimitsBar.app from main.swift and relaunches it. Re-run after edits.
 set -euo pipefail
