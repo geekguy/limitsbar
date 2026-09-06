@@ -260,23 +260,29 @@ def sessions():
     out = []
     claude_email = {d: a["emailAddress"] for d, a, _, _ in claude_profiles()}
     codex_email = {d: (jwt(t.get("id_token") or t["access_token"]).get("email") or "?") for d, t in codex_profiles()}
-    # Claude Code registers every interactive session under ~/.claude/sessions/<pid>.json, whatever its profile
-    for f in glob.glob(f"{HOME}/.claude/sessions/*.json"):
+    def comm(pid):
+        try:
+            return subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        except Exception:
+            return ""
+    # Claude Code registers each interactive session as <config dir>/sessions/<pid>.json; pids get reused, so check the name
+    seen = set()
+    for f in glob.glob(f"{HOME}/.claude/sessions/*.json") + glob.glob(f"{HOME}/.claude-*/sessions/*.json"):
         try:
             s = json.load(open(f))
             pid = int(s["pid"])
-            os.kill(pid, 0)
         except Exception:
             continue
-        if s.get("kind", "interactive") != "interactive":
+        if pid in seen or s.get("kind", "interactive") != "interactive" or not comm(pid).endswith("claude"):
             continue
+        seen.add(pid)
         d = proc_env(pid, "CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
         out.append({"provider": "claude", "pid": pid, "dir": d, "account": claude_email.get(d, "?"),
                     "name": s.get("name") or os.path.basename(s.get("cwd", "")), "cwd": s.get("cwd", ""),
                     "active": s.get("status", "idle") != "idle", "started_epoch": int(s.get("startedAt", 0)) / 1000})
     # Codex: the native TUI binary (child of the node shim); helpers such as app-server carry a subcommand
     try:
-        ps = subprocess.run(["ps", "-axo", "pid=,etime=,args="], capture_output=True, text=True).stdout
+        ps = subprocess.run(["ps", "-axwwo", "pid=,etime=,args="], capture_output=True, text=True).stdout
     except Exception:
         ps = ""
     for line in ps.splitlines():

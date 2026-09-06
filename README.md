@@ -7,6 +7,10 @@ A tiny macOS menu bar app that shows Claude Code and Codex usage limits — 5-ho
 - **Menu bar:** the lowest 5-hour usage per provider, e.g. `C 18% · X 100%`, i.e. the account with the most headroom right now.
 - **Dropdown:** every account, most headroom first, with 5-hour / weekly / Fable bars, a countdown and time for each reset, a thin timeline of how far along each window is, Codex credit status, and Codex "limit reset" credits with the expiry date of each. Refreshes every 5 minutes.
 
+## Sessions
+
+Each account card shows how many interactive sessions are running on it and how many are busy, and a collapsible **sessions running** row at the bottom lists them all: account, session name, folder, and age, busy ones first. Sessions are attributed to accounts by reading each process's own environment (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), so nothing has to be installed in the CLIs. Claude Code sessions come from its per-profile `sessions/` registry (which also carries name and idle/busy state); Codex sessions are the running TUI processes.
+
 ## Shortcut
 
 **⌘⇧L** toggles the popover from anywhere. It's a system-wide hotkey (Carbon, no Accessibility permission), which also means the frontmost app doesn't receive that keystroke while LimitsBar runs. To rebind, change the key code and modifiers in `HotKey.register()` in `main.swift` and rebuild.
