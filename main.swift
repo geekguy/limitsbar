@@ -9,8 +9,8 @@ struct Win: Decodable, Sendable {
     enum CodingKeys: String, CodingKey { case pct, resets, resetsEpoch = "resets_epoch", windowSeconds = "window_seconds" }
 }
 struct LimitResets: Decodable, Sendable {
-    var available: Int?; var usableNow: Int?
-    enum CodingKeys: String, CodingKey { case available, usableNow = "usable_now" }
+    var available: Int?; var usableNow: Int?; var expires: [Double]?   // one expiry per credit, ascending
+    enum CodingKeys: String, CodingKey { case available, usableNow = "usable_now", expires }
 }
 struct Row: Decodable, Identifiable, Sendable {
     var provider: String; var name: String; var plan: String?; var note: String?
@@ -98,6 +98,15 @@ func usageColor(_ p: Double?) -> Color {
     return p < 50 ? .green : p < 80 ? .orange : .red
 }
 
+/// "21 Sep (in 15d), 4 Oct (in 28d), 4 Oct (in 28d)" — one entry per reset credit
+func expiryList(_ epochs: [Double], now: Date) -> String {
+    let df = DateFormatter(); df.dateFormat = "d MMM"
+    return epochs.map { e in
+        let date = Date(timeIntervalSince1970: e), days = Int(date.timeIntervalSince(now) / 86400)
+        return df.string(from: date) + (days <= 0 ? " (today)" : " (in \(days)d)")
+    }.joined(separator: ", ")
+}
+
 func countdown(_ t: TimeInterval) -> String {
     let s = Int(max(0, t)), d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
     if d > 0 { return "\(d)d \(h)h" }
@@ -167,6 +176,9 @@ struct RowView: View {
                     Text(n).font(.caption2).foregroundStyle(n.contains("(out)") || n.contains("expired") ? .red : .secondary)
                         .lineLimit(1).truncationMode(.middle)
                 }
+            }
+            if let ex = row.limitResets?.expires, !ex.isEmpty {
+                Text("limit resets expire " + expiryList(ex, now: now)).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
             HStack(alignment: .top, spacing: 14) {
                 Bar(label: "5 hour", win: row.fiveH, now: now)

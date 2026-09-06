@@ -100,9 +100,9 @@ def codex_usage(t):
     if jwt(t["access_token"]).get("exp", 0) < time.time():
         row["note"] = "token expired; open a codex session once"
         return row
+    hdr = {"Authorization": f"Bearer {t['access_token']}", "ChatGPT-Account-Id": t.get("account_id") or auth.get("chatgpt_account_id", ""), "User-Agent": "limits/1"}
     try:
-        u = get("https://chatgpt.com/backend-api/wham/usage",
-                {"Authorization": f"Bearer {t['access_token']}", "ChatGPT-Account-Id": t.get("account_id") or auth.get("chatgpt_account_id", ""), "User-Agent": "limits/1"})
+        u = get("https://chatgpt.com/backend-api/wham/usage", hdr)
     except Exception as e:
         row["note"] = f"fetch failed: {str(e)[:40]}"
         return row
@@ -131,7 +131,13 @@ def codex_usage(t):
         row["note"] = "credits: " + ("unlimited" if cr.get("unlimited") else f"{cr.get('balance') or 0}" + ("" if cr.get("has_credits") else " (out)"))
     rc = u.get("rate_limit_reset_credits") or {}
     if rc.get("available_count") is not None:   # Codex perk: reset a hit limit early
-        row["limit_resets"] = {"available": rc.get("available_count"), "usable_now": rc.get("applicable_available_count")}
+        lr = {"available": rc.get("available_count"), "usable_now": rc.get("applicable_available_count")}
+        try:   # each credit expires on its own date
+            cs = get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", hdr).get("credits") or []
+            lr["expires"] = sorted(e for e in (window(None, c.get("expires_at"), None)["resets_epoch"] for c in cs if c.get("status") == "available") if e)
+        except Exception:
+            pass
+        row["limit_resets"] = lr
     return row
 
 
