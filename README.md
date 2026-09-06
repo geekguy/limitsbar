@@ -9,7 +9,7 @@ A tiny macOS menu bar app that shows Claude Code and Codex usage limits — 5-ho
 
 ## Sessions
 
-Each account card shows how many interactive sessions are running on it and how many are busy, and a collapsible **sessions running** row at the bottom lists them all: account, session name, folder, and age, busy ones first. Sessions are attributed to accounts by reading each process's own environment (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), so nothing has to be installed in the CLIs. Claude Code sessions come from its per-profile `sessions/` registry (which also carries name and idle/busy state); Codex sessions are the running TUI processes.
+Each account card shows how many interactive sessions are running on it and how many are busy, and a collapsible **sessions running** row at the bottom lists them all: account, session name, folder, and age, busy ones first, with a filter box (name, folder, or account). **open** brings that session's iTerm tab to the front, matched by tty; if no tab is found (other terminal, or it was closed), the exact resume command for that profile is copied to the clipboard instead. The popover body scrolls within the screen height with the footer pinned. Sessions are attributed to accounts by reading each process's own environment (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), so nothing has to be installed in the CLIs. Claude Code sessions come from its per-profile `sessions/` registry (which also carries name and idle/busy state); Codex sessions are the running TUI processes.
 
 ## Shortcut
 
