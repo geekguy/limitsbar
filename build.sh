@@ -1,5 +1,3 @@
-pkill -x LimitsBar 2>/dev/null || true
-while pgrep -x LimitsBar >/dev/null; do sleep 0.2; done   # let the old instance exit first; `open` fails with -600 otherwise
 #!/bin/bash
 # Builds ~/Applications/LimitsBar.app from main.swift and relaunches it. Re-run after edits.
 set -euo pipefail
@@ -22,5 +20,6 @@ cat > "$app/Contents/Info.plist" <<'EOF'
 EOF
 codesign -s - -f "$app" >/dev/null 2>&1 || true
 pkill -x LimitsBar 2>/dev/null || true
+while pgrep -x LimitsBar >/dev/null; do sleep 0.2; done   # let the old instance exit first; `open` fails with -600 otherwise
 open "$app"
 echo "built and launched $app"
