@@ -12,17 +12,12 @@ struct LimitResets: Decodable, Sendable {
     var available: Int?; var usableNow: Int?
     enum CodingKeys: String, CodingKey { case available, usableNow = "usable_now" }
 }
-struct Extra: Decodable, Identifiable, Sendable {
-    var name: String; var fiveH: Win?; var week: Win?
-    var id: String { name }
-    enum CodingKeys: String, CodingKey { case name, fiveH = "5h", week }
-}
 struct Row: Decodable, Identifiable, Sendable {
     var provider: String; var name: String; var plan: String?; var note: String?
     var fiveH: Win?; var week: Win?; var fable: Win?
-    var limitResets: LimitResets?; var extra: [Extra]?
+    var limitResets: LimitResets?
     var id: String { provider + "|" + name }
-    enum CodingKeys: String, CodingKey { case provider, name, plan, note, fiveH = "5h", week, fable, limitResets = "limit_resets", extra }
+    enum CodingKeys: String, CodingKey { case provider, name, plan, note, fiveH = "5h", week, fable, limitResets = "limit_resets" }
 }
 
 @MainActor final class Model: ObservableObject {
@@ -174,18 +169,9 @@ struct RowView: View {
                 }
             }
             HStack(alignment: .top, spacing: 14) {
-                Bar(label: "5 hour", win: row.fiveH, weekly: false, now: now)
-                Bar(label: "Weekly", win: row.week, weekly: true, now: now)
-                if row.fable != nil { Bar(label: "Fable weekly", win: row.fable, weekly: true, now: now) }   // Max plans only
-            }
-            ForEach(row.extra ?? []) { e in   // per-model limits on top of the account limit
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(e.name).font(.caption2.weight(.medium)).foregroundStyle(.secondary)
-                    HStack(alignment: .top, spacing: 14) {
-                        Bar(label: "5 hour", win: e.fiveH, weekly: false, now: now)
-                        Bar(label: "Weekly", win: e.week, weekly: true, now: now)
-                    }
-                }
+                Bar(label: "5 hour", win: row.fiveH, now: now)
+                Bar(label: "Weekly", win: row.week, now: now)
+                if row.fable != nil { Bar(label: "Fable weekly", win: row.fable, now: now) }   // Max plans only
             }
         }
         .padding(10)
@@ -202,7 +188,7 @@ struct Tag: View {
 }
 
 struct Bar: View {
-    let label: String; let win: Win?; let weekly: Bool; let now: Date
+    let label: String; let win: Win?; let now: Date
     var body: some View {
         let pct = win?.pct
         VStack(alignment: .leading, spacing: 3) {
@@ -221,7 +207,9 @@ struct Bar: View {
                     }
                 }.frame(height: 3)
             }
-            Text(resetText).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+            let lines = resetLines
+            Text(lines.0).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+            if !lines.1.isEmpty { Text(lines.1).font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
         }
         .frame(maxWidth: .infinity)
     }
@@ -231,13 +219,14 @@ struct Bar: View {
         return min(max(1 - (r - now.timeIntervalSince1970) / w, 0), 1)
     }
 
-    var resetText: String {
-        guard win?.pct != nil else { return "not tracked on this plan" }
-        guard let r = win?.resetsEpoch else { return "no reset time reported" }
+    /// (countdown, absolute date) — the date line always carries the day so weekly resets are unambiguous
+    var resetLines: (String, String) {
+        guard win?.pct != nil else { return ("not tracked on this plan", "") }
+        guard let r = win?.resetsEpoch else { return ("no reset time reported", "") }
         let date = Date(timeIntervalSince1970: r), rem = date.timeIntervalSince(now)
-        if rem <= 0 { return "resets now" }
-        let df = DateFormatter()
-        df.dateFormat = (weekly || rem > 86400) ? "EEE HH:mm" : "HH:mm"
-        return "resets in \(countdown(rem)) · \(df.string(from: date))"
+        if rem <= 0 { return ("resets now", "") }
+        let cal = Calendar.current, df = DateFormatter()
+        df.dateFormat = cal.isDateInToday(date) ? "'today' HH:mm" : cal.isDateInTomorrow(date) ? "'tomorrow' HH:mm" : "EEE d MMM HH:mm"
+        return ("resets in \(countdown(rem))", df.string(from: date))
     }
 }

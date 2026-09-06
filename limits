@@ -132,10 +132,6 @@ def codex_usage(t):
     rc = u.get("rate_limit_reset_credits") or {}
     if rc.get("available_count") is not None:   # Codex perk: reset a hit limit early
         row["limit_resets"] = {"available": rc.get("available_count"), "usable_now": rc.get("applicable_available_count")}
-    extra = [{"name": a.get("limit_name") or a.get("metered_feature") or "extra", **slots(a.get("rate_limit") or {})}
-             for a in u.get("additional_rate_limits") or []]
-    if extra:   # per-model limits some plans carry on top of the account limit
-        row["extra"] = extra
     return row
 
 
