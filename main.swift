@@ -219,9 +219,7 @@ struct Bar: View {
                     }
                 }.frame(height: 3)
             }
-            let lines = resetLines
-            Text(lines.0).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
-            if !lines.1.isEmpty { Text(lines.1).font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
+            Text(resetText).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
         }
         .frame(maxWidth: .infinity)
     }
@@ -231,14 +229,13 @@ struct Bar: View {
         return min(max(1 - (r - now.timeIntervalSince1970) / w, 0), 1)
     }
 
-    /// (countdown, absolute date) — the date line always carries the day so weekly resets are unambiguous
-    var resetLines: (String, String) {
-        guard win?.pct != nil else { return ("not tracked on this plan", "") }
-        guard let r = win?.resetsEpoch else { return ("no reset time reported", "") }
+    var resetText: String {
+        guard win?.pct != nil else { return "not tracked on this plan" }
+        guard let r = win?.resetsEpoch else { return "no reset time reported" }
         let date = Date(timeIntervalSince1970: r), rem = date.timeIntervalSince(now)
-        if rem <= 0 { return ("resets now", "") }
-        let cal = Calendar.current, df = DateFormatter()
-        df.dateFormat = cal.isDateInToday(date) ? "'today' HH:mm" : cal.isDateInTomorrow(date) ? "'tomorrow' HH:mm" : "EEE d MMM HH:mm"
-        return ("resets in \(countdown(rem))", df.string(from: date))
+        if rem <= 0 { return "resets now" }
+        let df = DateFormatter()
+        df.dateFormat = rem > 86400 ? "EEE HH:mm" : "HH:mm"
+        return "resets in \(countdown(rem)) · \(df.string(from: date))"
     }
 }
