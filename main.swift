@@ -52,8 +52,17 @@ struct Row: Decodable, Identifiable, Sendable {
     enum CodingKeys: String, CodingKey { case provider, name, plan, note, fiveH = "5h", week, fable, limitResets = "limit_resets", dir, primary }
 }
 
+struct Session: Decodable, Identifiable, Sendable {
+    var provider: String; var pid: Int; var dir: String; var account: String; var name: String; var cwd: String
+    var active: Bool?; var startedEpoch: Double   // active is nil where the tool exposes no idle/busy state (Codex)
+    var id: String { "\(provider)|\(pid)" }
+    enum CodingKeys: String, CodingKey { case provider, pid, dir, account, name, cwd, active, startedEpoch = "started_epoch" }
+}
+struct Payload: Decodable, Sendable { var accounts: [Row]; var sessions: [Session] }
+
 @MainActor final class Model: ObservableObject {
     @Published var rows: [Row] = []
+    @Published var sessions: [Session] = []
     @Published var updated = "…"
     @Published var error = ""
     @Published var busy = false
@@ -190,16 +199,17 @@ struct Row: Decodable, Identifiable, Sendable {
         guard !busy else { return }
         busy = true
         Task.detached {
-            let (rows, err) = Self.fetch()
+            let (payload, err) = Self.fetch()
             await MainActor.run {
-                self.rows = rows; self.error = err; self.busy = false
+                if let p = payload { self.rows = p.accounts; self.sessions = p.sessions }
+                self.error = err; self.busy = false
                 self.updated = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-                if !rows.isEmpty { self.notify(rows) }
+                if let p = payload, !p.accounts.isEmpty { self.notify(p.accounts) }
             }
         }
     }
 
-    nonisolated static func fetch() -> ([Row], String) {
+    nonisolated static func fetch() -> (Payload?, String) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let py = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
             .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
@@ -208,13 +218,13 @@ struct Row: Decodable, Identifiable, Sendable {
         p.arguments = [home + "/.local/bin/limits", "--json"]
         let out = Pipe(), err = Pipe()
         p.standardOutput = out; p.standardError = err
-        do { try p.run() } catch { return ([], "cannot run limits: \(error.localizedDescription)") }
+        do { try p.run() } catch { return (nil, "cannot run limits: \(error.localizedDescription)") }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         let edata = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        do { return (try JSONDecoder().decode([Row].self, from: data), "") } catch {
+        do { return (try JSONDecoder().decode(Payload.self, from: data), "") } catch {
             let msg = String(data: edata, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return ([], msg.isEmpty ? "limits returned no usable data" : String(msg.suffix(200)))
+            return (nil, msg.isEmpty ? "limits returned no usable data" : String(msg.suffix(200)))
         }
     }
 }
@@ -260,6 +270,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 12) {
                 ProviderSection(model: model, provider: "claude", title: "Claude", accent: .orange, now: ctx.date)
                 ProviderSection(model: model, provider: "codex", title: "Codex", accent: .teal, now: ctx.date)
+                if !model.sessions.isEmpty { SessionsSection(sessions: model.sessions, now: ctx.date) }
                 if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red) }
                 if model.rows.isEmpty && model.error.isEmpty {
                     Text(model.busy ? "Loading…" : "No accounts found").font(.caption).foregroundStyle(.secondary)
@@ -314,19 +325,60 @@ struct ProviderSection: View {
                     }
                 }
             }
-            ForEach(rows) { r in RowView(row: r, now: now, makePrimary: { model.setPrimary(r) }) }
+            ForEach(rows) { r in
+                RowView(row: r, now: now, sessions: model.sessions.filter { $0.provider == r.provider && $0.dir == r.dir },
+                        makePrimary: { model.setPrimary(r) })
+            }
+        }
+    }
+}
+
+/// Every running interactive session, attributed to its account: what is burning which limit, and what to close.
+struct SessionsSection: View {
+    let sessions: [Session]; let now: Date
+    @State private var open = false
+    var body: some View {
+        let active = sessions.filter { $0.active == true }.count
+        let sorted = sessions.sorted {
+            ($0.account, $0.active == true ? 0 : 1, -$0.startedEpoch) < ($1.account, $1.active == true ? 0 : 1, -$1.startedEpoch)
+        }
+        DisclosureGroup(isExpanded: $open) {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(sorted) { s in
+                    HStack(spacing: 6) {
+                        Circle().fill(s.active == true ? Color.green : s.active == nil ? Color.teal.opacity(0.6) : Color.gray.opacity(0.5))
+                            .frame(width: 6, height: 6)
+                        Text(Model.short(s.account)).font(.caption2.weight(.medium)).frame(width: 60, alignment: .leading)
+                        Text(s.name).font(.caption2).lineLimit(1)
+                        Text(s.cwd.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))
+                            .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.head)
+                        Spacer(minLength: 4)
+                        Text(countdown(now.timeIntervalSince1970 - s.startedEpoch)).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            let counts = Dictionary(grouping: sessions, by: { $0.account }).mapValues(\.count)
+                .sorted { $0.value > $1.value }.map { "\(Model.short($0.key)) \($0.value)" }.joined(separator: " · ")
+            Text("\(sessions.count) session\(sessions.count == 1 ? "" : "s") running · \(active) active · \(counts)")
+                .font(.caption.weight(.semibold)).foregroundStyle(.secondary).lineLimit(1)
         }
     }
 }
 
 struct RowView: View {
-    let row: Row; let now: Date; let makePrimary: () -> Void
+    let row: Row; let now: Date; let sessions: [Session]; let makePrimary: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Circle().fill(usageColor(row.fiveH?.pct ?? row.week?.pct)).frame(width: 7, height: 7)
                 Text(row.name).font(.body.weight(.medium)).lineLimit(1).truncationMode(.middle)
                 if let p = row.plan, !p.isEmpty { Tag(text: p) }
+                if !sessions.isEmpty {
+                    let a = sessions.filter { $0.active == true }.count
+                    Tag(text: "\(sessions.count) session\(sessions.count == 1 ? "" : "s")" + (a > 0 ? " · \(a) active" : ""))
+                }
                 if row.primary == true {
                     Tag(text: "primary", accent: true)
                 } else if row.dir != nil {

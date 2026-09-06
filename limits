@@ -235,6 +235,70 @@ def add_profile(provider, name):
     print(f"created {d}\nsign in from a new terminal with: {cmd}")
 
 
+# ---------- sessions ----------
+def proc_env(pid, key):
+    """Value of an env var in one of our running processes (ps -E appends the environment to args)."""
+    try:
+        args = subprocess.run(["ps", "-wwE", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout
+    except Exception:
+        return None
+    m = re.search(rf"(?:^| ){re.escape(key)}=(\S+)", args)
+    return m.group(1) if m else None
+
+
+def etime_seconds(s):
+    """ps etime ([[dd-]hh:]mm:ss) -> seconds."""
+    days, _, rest = s.partition("-") if "-" in s else ("0", "", s)
+    parts = [int(x) for x in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return int(days) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def sessions():
+    """Running interactive sessions, each attributed to a profile through its process environment."""
+    out = []
+    claude_email = {d: a["emailAddress"] for d, a, _, _ in claude_profiles()}
+    codex_email = {d: (jwt(t.get("id_token") or t["access_token"]).get("email") or "?") for d, t in codex_profiles()}
+    # Claude Code registers every interactive session under ~/.claude/sessions/<pid>.json, whatever its profile
+    for f in glob.glob(f"{HOME}/.claude/sessions/*.json"):
+        try:
+            s = json.load(open(f))
+            pid = int(s["pid"])
+            os.kill(pid, 0)
+        except Exception:
+            continue
+        if s.get("kind", "interactive") != "interactive":
+            continue
+        d = proc_env(pid, "CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
+        out.append({"provider": "claude", "pid": pid, "dir": d, "account": claude_email.get(d, "?"),
+                    "name": s.get("name") or os.path.basename(s.get("cwd", "")), "cwd": s.get("cwd", ""),
+                    "active": s.get("status", "idle") != "idle", "started_epoch": int(s.get("startedAt", 0)) / 1000})
+    # Codex: the native TUI binary (child of the node shim); helpers such as app-server carry a subcommand
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid=,etime=,args="], capture_output=True, text=True).stdout
+    except Exception:
+        ps = ""
+    for line in ps.splitlines():
+        parts = line.split(None, 2)
+        argv = parts[2].split() if len(parts) == 3 else []
+        if not argv or not argv[0].endswith("/codex"):
+            continue
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub and not sub.startswith("-") and sub not in ("resume", "fork"):
+            continue
+        pid, age = int(parts[0]), etime_seconds(parts[1])
+        d = proc_env(pid, "CODEX_HOME") or f"{HOME}/.codex"
+        try:
+            lsof = subprocess.run(["lsof", "-p", str(pid), "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True).stdout
+            cwd = next((l[1:] for l in lsof.splitlines() if l.startswith("n")), "")
+        except Exception:
+            cwd = ""
+        out.append({"provider": "codex", "pid": pid, "dir": d, "account": codex_email.get(d, "?"), "name": os.path.basename(cwd) or "codex",
+                    "cwd": cwd, "active": None, "started_epoch": time.time() - age})
+    return out
+
+
 # ---------- render ----------
 def bar(v, weekly=False, width=10):
     if not v or v.get("pct") is None:
@@ -252,7 +316,7 @@ def bar(v, weekly=False, width=10):
     return f"{col}{'█' * n}{'░' * (width - n)}\033[0m {p:3.0f}% {when:<9}"
 
 
-def render(rows):
+def render(rows, sess=()):
     out = []
     for prov in ("claude", "codex"):
         group = [r for r in rows if r["provider"] == prov]
@@ -260,7 +324,8 @@ def render(rows):
             continue
         out.append(f"\033[1m{prov.upper()}\033[0m")
         for r in group:
-            name = ("★ " if r.get("primary") else "  ") + (f"{r['name']} ({r['plan']})" if r.get("plan") else r["name"])
+            n = sum(1 for s in sess if s["provider"] == prov and s["dir"] == r.get("dir"))
+            name = ("★ " if r.get("primary") else "  ") + (f"{r['name']} ({r['plan']})" if r.get("plan") else r["name"]) + (f" [{n} sess]" if n else "")
             line = f"  {name:<34} 5h {bar(r.get('5h'))}  wk {bar(r.get('week'), True)}"
             if prov == "claude":
                 line += f"  Fable {bar(r.get('fable'), True)}"
@@ -284,15 +349,15 @@ if __name__ == "__main__":
     if args[:1] == ["add"]:
         add_profile(args[1] if len(args) > 1 else "", args[2] if len(args) > 2 else "")
     elif "--json" in args:
-        print(json.dumps(collect(), indent=2))
+        print(json.dumps({"accounts": collect(), "sessions": sessions()}, indent=2))
     elif "--watch" in args:
         i = args.index("--watch")
         every = int(args[i + 1]) if len(args) > i + 1 and args[i + 1].isdigit() else 300
         try:
             while True:
-                print("\033[2J\033[H" + render(collect()) + f"  every {every}s, ctrl-c to stop", flush=True)
+                print("\033[2J\033[H" + render(collect(), sessions()) + f"  every {every}s, ctrl-c to stop", flush=True)
                 time.sleep(every)
         except KeyboardInterrupt:
             pass
     else:
-        print(render(collect()))
+        print(render(collect(), sessions()))
