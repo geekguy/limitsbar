@@ -3,6 +3,8 @@
 // profiles the CLIs use). Build with ./build.sh; it produces ~/Applications/LimitsBar.app.
 import SwiftUI
 import AppKit
+import ServiceManagement
+import UserNotifications
 
 struct Win: Decodable, Sendable {
     var pct: Double?; var resets: String?; var resetsEpoch: Double?; var windowSeconds: Double?
@@ -26,22 +28,85 @@ struct Row: Decodable, Identifiable, Sendable {
     @Published var updated = "…"
     @Published var error = ""
     @Published var busy = false
-    private var timer: Timer?
+    @Published var tick = Date()   // drives the title countdown between fetches
+    @Published var loginItem = SMAppService.mainApp.status == .enabled
+    private var timer: Timer?, ticker: Timer?
+    private var previous: [String: Row] = [:]   // last sample per account, for threshold crossings
 
     init() {
+        if Bundle.main.bundleIdentifier != nil {   // notifications need a real bundle; skip when run bare
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        ticker = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick = Date() }
+        }
     }
 
-    /// Menu bar text: lowest 5h usage per provider, i.e. the account with the most headroom.
+    static func short(_ name: String) -> String {   // "visual.design@airtribe.live" -> "visual"
+        let local = name.split(separator: "@").first.map(String.init) ?? name
+        return local.split(separator: ".").first.map(String.init) ?? local
+    }
+    static func headroom(_ r: Row) -> Win? { r.fiveH ?? r.week }   // the window that gates usage right now
+
+    /// Menu bar text: per provider, the account with the most headroom and its usage; if every
+    /// account is exhausted, the soonest reset instead.
     var title: String {
-        func best(_ p: String) -> String {
-            let v = rows.filter { $0.provider == p }.compactMap { $0.fiveH?.pct }.min()
-            return v.map { "\(Int($0.rounded()))%" } ?? "–"
+        func part(_ p: String, _ letter: String) -> String {
+            let rs = rows.filter { $0.provider == p }
+            guard let best = rs.min(by: { (Self.headroom($0)?.pct ?? 999) < (Self.headroom($1)?.pct ?? 999) }),
+                  let pct = Self.headroom(best)?.pct else { return "\(letter) –" }
+            if pct < 100 { return "\(letter) \(Self.short(best.name)) \(Int(pct.rounded()))%" }
+            if let soonest = rs.compactMap({ Self.headroom($0)?.resetsEpoch }).min() {
+                return "\(letter) ⏱ \(countdown(soonest - tick.timeIntervalSince1970))"
+            }
+            return "\(letter) 100%"
         }
-        return "C \(best("claude")) · X \(best("codex"))"
+        return part("claude", "C") + " · " + part("codex", "X")
+    }
+
+    /// Reset alerts are handed to the system at the exact reset time of any exhausted window;
+    /// 80% / 100% alerts fire when a window crosses the line between two samples.
+    private func notify(_ new: [Row]) {
+        let center = UNUserNotificationCenter.current()
+        let df = DateFormatter(); df.dateFormat = "EEE HH:mm"
+        for r in new {
+            let prev = previous[r.id]
+            for (label, w, pw) in [("5-hour", r.fiveH, prev?.fiveH), ("weekly", r.week, prev?.week), ("Fable weekly", r.fable, prev?.fable)] {
+                guard let pct = w?.pct else { continue }
+                let id = "\(r.id)|\(label)", who = "\(Self.short(r.name)) (\(r.provider))"
+                let resetAt = w?.resetsEpoch.map { Date(timeIntervalSince1970: $0) }
+                if pct >= 100, let at = resetAt, at > Date() {
+                    let c = UNMutableNotificationContent()
+                    c.title = "\(who): \(label) limit reset"; c.body = "\(r.name) is usable again"; c.sound = .default
+                    center.add(UNNotificationRequest(identifier: "reset|" + id, content: c,
+                                                     trigger: UNTimeIntervalNotificationTrigger(timeInterval: max(1, at.timeIntervalSinceNow), repeats: false)))
+                } else {
+                    center.removePendingNotificationRequests(withIdentifiers: ["reset|" + id])
+                }
+                guard let pp = pw?.pct else { continue }
+                for thr in [80.0, 100.0] where pp < thr && pct >= thr {
+                    let c = UNMutableNotificationContent()
+                    c.title = thr >= 100 ? "\(who): \(label) limit reached" : "\(who): \(label) at \(Int(pct.rounded()))%"
+                    c.body = resetAt.map { "resets \(df.string(from: $0))" } ?? r.name; c.sound = .default
+                    center.add(UNNotificationRequest(identifier: "thr|\(id)|\(Int(thr))|\(Int(Date().timeIntervalSince1970))", content: c, trigger: nil))
+                }
+            }
+            previous[r.id] = r
+        }
+    }
+
+    func setLoginItem(_ on: Bool) {
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch { self.error = "login item: \(error.localizedDescription)" }
+        loginItem = SMAppService.mainApp.status == .enabled
+        if on && SMAppService.mainApp.status == .requiresApproval {
+            self.error = "Approve LimitsBar under System Settings → General → Login Items"
+        }
     }
 
     func rows(for provider: String) -> [Row] {
@@ -67,6 +132,7 @@ struct Row: Decodable, Identifiable, Sendable {
             await MainActor.run {
                 self.rows = rows; self.error = err; self.busy = false
                 self.updated = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+                if !rows.isEmpty { self.notify(rows) }
             }
         }
     }
@@ -137,8 +203,11 @@ struct ContentView: View {
                     Text(model.busy ? "Loading…" : "No accounts found").font(.caption).foregroundStyle(.secondary)
                 }
                 Divider()
-                HStack {
-                    Text("Updated \(model.updated) · refreshes every 5 min").font(.caption2).foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    Text("Updated \(model.updated)").font(.caption2).foregroundStyle(.secondary)
+                        .help("Refreshes every 5 minutes")
+                    Toggle("Start at login", isOn: Binding(get: { model.loginItem }, set: { model.setLoginItem($0) }))
+                        .toggleStyle(.checkbox).font(.caption)
                     Spacer()
                     Button(model.busy ? "Refreshing…" : "Refresh") { model.refresh() }.disabled(model.busy)
                     Button("Quit") { NSApp.terminate(nil) }
