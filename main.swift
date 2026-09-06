@@ -5,6 +5,35 @@ import SwiftUI
 import AppKit
 import ServiceManagement
 import UserNotifications
+import Carbon.HIToolbox
+
+/// Global ⌘⇧L toggles the popover. Carbon hotkeys need no Accessibility permission; note the
+/// frontmost app never sees the keystroke while LimitsBar runs. Change `kVK_ANSI_L` / modifiers to rebind.
+enum HotKey {
+    nonisolated(unsafe) static var ref: EventHotKeyRef?
+    static func register() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            MainActor.assumeIsolated { toggleStatusItem() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let id = EventHotKeyID(signature: OSType(0x4C4D4254), id: 1)   // "LMBT"
+        RegisterEventHotKey(UInt32(kVK_ANSI_L), UInt32(cmdKey | shiftKey), id, GetApplicationEventTarget(), 0, &ref)
+    }
+}
+
+/// SwiftUI's MenuBarExtra has no open/close API; clicking its status-bar button toggles the window.
+@MainActor func toggleStatusItem() {
+    func button(in v: NSView?) -> NSStatusBarButton? {
+        guard let v else { return nil }
+        if let b = v as? NSStatusBarButton { return b }
+        for s in v.subviews { if let b = button(in: s) { return b } }
+        return nil
+    }
+    for w in NSApp.windows where w.className.contains("StatusBarWindow") {
+        if let b = button(in: w.contentView) { b.performClick(nil); return }
+    }
+}
 
 struct Win: Decodable, Sendable {
     var pct: Double?; var resets: String?; var resetsEpoch: Double?; var windowSeconds: Double?
@@ -37,6 +66,7 @@ struct Row: Decodable, Identifiable, Sendable {
         if Bundle.main.bundleIdentifier != nil {   // notifications need a real bundle; skip when run bare
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
+        HotKey.register()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
@@ -236,7 +266,7 @@ struct ContentView: View {
                 }
                 Divider()
                 HStack(spacing: 10) {
-                    Text("Updated \(model.updated)").font(.caption2).foregroundStyle(.secondary)
+                    Text("Updated \(model.updated) · ⌘⇧L toggles").font(.caption2).foregroundStyle(.secondary)
                         .help("Refreshes every 5 minutes")
                     Toggle("Start at login", isOn: Binding(get: { model.loginItem }, set: { model.setLoginItem($0) }))
                         .toggleStyle(.checkbox).font(.caption)
