@@ -104,7 +104,7 @@ struct Payload: Decodable, Sendable { var accounts: [Row]; var sessions: [Sessio
         }
     }
 
-    static func short(_ name: String) -> String {   // "visual.design@airtribe.live" -> "visual"
+    static func short(_ name: String) -> String {   // "jane.doe@example.com" -> "jane"
         let local = name.split(separator: "@").first.map(String.init) ?? name
         return local.split(separator: ".").first.map(String.init) ?? local
     }
